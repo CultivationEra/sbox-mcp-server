@@ -4,6 +4,8 @@ using System.Linq;
 using System.Reflection;
 using System.Text.Json;
 using System.Threading.Tasks;
+using Editor;
+using Sandbox;
 using SandboxModelContextProtocol.Editor.Commands.Attributes;
 using SandboxModelContextProtocol.Editor.Tools.Models;
 
@@ -16,6 +18,14 @@ public static class McpToolExecutor
 
 	static McpToolExecutor()
 	{
+		// Initialize tools on startup
+		InitializeTools();
+	}
+
+	[EditorEvent.Hotload]
+	internal static void OnHotload()
+	{
+		// Reinitialize tools when hotloading
 		InitializeTools();
 	}
 
@@ -31,10 +41,11 @@ public static class McpToolExecutor
 			}
 
 			Log.Info( $"Calling tool: {request.Name}" );
+
 			// Find the tool method
-			if ( !_toolMethods.TryGetValue( request.Name, out MethodInfo? method ) )
+			if ( !_toolMethods.TryGetValue( request.Name, out MethodInfo? method ) || method is null )
 			{
-				Log.Error( $"Tool not found: {request.Name}" );
+				Log.Warning( $"Tool not found: {request.Name}" );
 				return new CallEditorToolResponse()
 				{
 					Id = request.Id,
@@ -44,32 +55,8 @@ public static class McpToolExecutor
 				};
 			}
 
-			// Prepare arguments for method invocation
-			object?[] parameters = PrepareMethodParameters( method, request.Arguments );
+			var result = await ExecuteOnMainThread( method, request );
 
-			Log.Info( $"Invoking method: {method.Name} with parameters: {JsonSerializer.Serialize( parameters )}" );
-
-			// Invoke the method
-			object? result = method.Invoke( null, parameters );
-
-			// Handle async methods
-			if ( result is Task task )
-			{
-				await task;
-
-				// Get the result from Task<T>
-				if ( task.GetType().IsGenericType )
-				{
-					PropertyInfo? resultProperty = task.GetType().GetProperty( "Result" );
-					result = resultProperty?.GetValue( task );
-				}
-				else
-				{
-					result = null; // Task without return value
-				}
-			}
-
-			// Return the result
 			return new CallEditorToolResponse()
 			{
 				Id = request.Id,
@@ -80,18 +67,84 @@ public static class McpToolExecutor
 		}
 		catch ( Exception ex )
 		{
-			Log.Error( $"Error executing tool '{request.Name}': {ex.Message}\n{ex.StackTrace}" );
-			Log.Error( $"Inner Exception: {ex.InnerException?.Message ?? "None"}" );
-			Log.Error( $"Source: {ex.Source}" );
-			Log.Error( $"Target Site: {ex.TargetSite}" );
+			Log.Warning( $"Error executing tool '{request.Name}': {ex.InnerException?.Message ?? ex.Message}" );
 			return new CallEditorToolResponse()
 			{
 				Id = request.Id,
 				Name = request.Name,
-				Content = [JsonSerializer.SerializeToElement( $"Error executing tool '{request.Name}': {ex.Message}" )],
+				Content = [JsonSerializer.SerializeToElement( $"Error executing tool '{request.Name}': {ex.InnerException?.Message ?? ex.Message}" )],
 				IsError = true,
 			};
 		}
+	}
+
+	private static async Task<object?> ExecuteOnMainThread( MethodInfo method, CallEditorToolRequest request )
+	{
+		var tcs = new TaskCompletionSource<object?>();
+
+		// Queue the method execution on the main thread
+		MainThread.Queue( () =>
+		{
+			try
+			{
+				// Prepare arguments for method invocation
+				object?[] parameters = PrepareMethodParameters( method, request.Arguments );
+
+				Log.Info( $"Invoking method: {method.Name} with parameters: {JsonSerializer.Serialize( parameters )}" );
+
+				// Invoke the method
+				object? result = method.Invoke( null, parameters );
+
+				// Handle async methods
+				if ( result is Task task )
+				{
+					// For async methods, we need to wait for completion and get the result
+					task.ContinueWith( t =>
+					{
+						try
+						{
+							if ( t.IsFaulted )
+							{
+								tcs.SetException( t.Exception?.InnerException ?? new Exception( "Unknown error in async method" ) );
+							}
+							else if ( t.IsCanceled )
+							{
+								tcs.SetCanceled();
+							}
+							else
+							{
+								// Get the result from Task<T>
+								if ( t.GetType().IsGenericType )
+								{
+									PropertyInfo? resultProperty = t.GetType().GetProperty( "Result" );
+									var taskResult = resultProperty?.GetValue( t );
+									tcs.SetResult( taskResult );
+								}
+								else
+								{
+									tcs.SetResult( null ); // Task without return value
+								}
+							}
+						}
+						catch ( Exception ex )
+						{
+							tcs.SetException( ex );
+						}
+					} );
+				}
+				else
+				{
+					// Synchronous method - set result immediately
+					tcs.SetResult( result );
+				}
+			}
+			catch ( Exception ex )
+			{
+				tcs.SetException( ex );
+			}
+		} );
+
+		return await tcs.Task;
 	}
 
 	private static void InitializeTools()
@@ -108,16 +161,14 @@ public static class McpToolExecutor
 				try
 				{
 					// Find all types with McpEditorToolTypeAttribute
-					Type[] toolTypes = assembly.GetTypes()
-						.Where( t => t.GetCustomAttribute<McpEditorToolTypeAttribute>() != null )
-						.ToArray();
+					Type[] toolTypes = [.. assembly.GetTypes().Where( t => t.GetCustomAttribute<McpEditorToolTypeAttribute>() != null )];
 
 					foreach ( Type toolType in toolTypes )
 					{
 						// Find all methods with McpEditorToolAttribute
-						MethodInfo[] toolMethods = toolType.GetMethods( BindingFlags.Public | BindingFlags.Static )
-							.Where( m => m.GetCustomAttribute<McpEditorToolAttribute>() != null )
-							.ToArray();
+						MethodInfo[] toolMethods = [.. toolType.GetMethods( BindingFlags.Public | BindingFlags.Static ).Where( m => m.GetCustomAttribute<McpEditorToolAttribute>() != null )];
+
+						Log.Info( $"Tool: {toolType.Name} {toolMethods.Length}" );
 
 						foreach ( MethodInfo method in toolMethods )
 						{
@@ -149,11 +200,13 @@ public static class McpToolExecutor
 	private static object?[] PrepareMethodParameters( MethodInfo method, IReadOnlyDictionary<string, JsonElement>? arguments )
 	{
 		ParameterInfo[] parameters = method.GetParameters();
+
 		object?[] parameterValues = new object?[parameters.Length];
 
 		for ( int i = 0; i < parameters.Length; i++ )
 		{
 			ParameterInfo parameter = parameters[i];
+			Log.Info( "test 2" );
 
 			if ( arguments != null && arguments.TryGetValue( parameter.Name ?? string.Empty, out JsonElement argumentValue ) )
 			{

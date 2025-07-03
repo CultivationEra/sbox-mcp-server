@@ -13,7 +13,12 @@ public class EditorSceneTool
 	[McpEditorTool]
 	public static JsonObject GetActiveEditorScene()
 	{
-		Scene? scene = SceneEditorSession.Active.Scene ?? throw new InvalidOperationException( "No scene found" );
+		Scene? scene = SceneEditorSession.Active.Scene;
+		if ( scene == null )
+		{
+			return new JsonObject( null );
+		}
+
 		return scene.Serialize();
 	}
 
