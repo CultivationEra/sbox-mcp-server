@@ -1,3 +1,4 @@
+#nullable enable
 using System;
 using System.Collections.Generic;
 using SandboxModelContextProtocol.Editor.Connection.Models;

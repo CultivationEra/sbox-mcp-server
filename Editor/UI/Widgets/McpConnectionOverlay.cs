@@ -1,3 +1,4 @@
+#nullable enable
 using Editor;
 using Sandbox;
 using SandboxModelContextProtocol.Editor.Connection;

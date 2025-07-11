@@ -1,3 +1,4 @@
+#nullable enable
 using System;
 using System.Text.Json.Nodes;
 using System.Threading.Tasks;
@@ -60,6 +61,7 @@ public class EditorSceneTool
 
 		try
 		{
+			// Use await to properly handle the async operation
 			await EditorScene.LoadFromScene( sceneFile );
 		}
 		catch ( Exception ex )

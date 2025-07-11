@@ -1,3 +1,4 @@
+#nullable enable
 using System;
 using System.Text.Json;
 using System.Threading;
@@ -7,6 +8,7 @@ using Sandbox;
 using SandboxModelContextProtocol.Editor.Connection.Models;
 using SandboxModelContextProtocol.Editor.Tools;
 using SandboxModelContextProtocol.Editor.Tools.Models;
+using SandboxModelContextProtocol.Editor.Resources;
 
 namespace SandboxModelContextProtocol.Editor.Connection;
 
@@ -42,6 +44,9 @@ public static class McpConnectionManager
 			_webSocket.OnMessageReceived += OnMessageReceived;
 			_webSocket.OnDisconnected += OnDisconnected;
 
+			// Initialize resource manager
+			McpResourceManager.Initialize();
+			
 			// Update status and emit connection success event
 			Status.SetConnected();
 			EditorEvent.Run( "mcp.connection.success" );
@@ -110,19 +115,55 @@ public static class McpConnectionManager
 
 			try
 			{
-				CallEditorToolRequest? request = JsonSerializer.Deserialize<CallEditorToolRequest>( message );
-				if ( request == null )
-				{
-					return;
-				}
-
-				CallEditorToolResponse? response = await McpToolExecutor.CallEditorTool( request );
-				await Send( JsonSerializer.Serialize( response ) );
+				await HandleIncomingMessage( message );
 			}
 			catch ( Exception ex )
 			{
-				Log.Error( $"Error calling tool: {ex.Message}\n{ex.StackTrace}" );
+				Log.Error( $"Error handling message: {ex.Message}\n{ex.StackTrace}" );
 			}
 		}, _cancellationTokenSource?.Token ?? CancellationToken.None );
 	};
+
+	private static async Task HandleIncomingMessage( string message )
+	{
+		// Try to parse as a generic JSON object to determine message type
+		using var document = JsonDocument.Parse( message );
+		var root = document.RootElement;
+		
+		if ( root.TryGetProperty( "method", out var methodProperty ) )
+		{
+			var method = methodProperty.GetString();
+			
+			// Route to appropriate handler based on method
+			if ( method?.StartsWith( "resources/" ) == true )
+			{
+				// Handle resource requests
+				var response = await McpResourceExecutor.HandleResourceRequest( message );
+				if ( response != null )
+				{
+					await Send( JsonSerializer.Serialize( response ) );
+				}
+			}
+			else
+			{
+				// Handle tool requests (existing functionality)
+				var request = JsonSerializer.Deserialize<CallEditorToolRequest>( message );
+				if ( request != null )
+				{
+					var response = await McpToolExecutor.CallEditorTool( request );
+					await Send( JsonSerializer.Serialize( response ) );
+				}
+			}
+		}
+		else
+		{
+			// Fallback to tool request handling for backward compatibility
+			var request = JsonSerializer.Deserialize<CallEditorToolRequest>( message );
+			if ( request != null )
+			{
+				var response = await McpToolExecutor.CallEditorTool( request );
+				await Send( JsonSerializer.Serialize( response ) );
+			}
+		}
+	}
 }
